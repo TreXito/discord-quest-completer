@@ -196,5 +196,8 @@ launch configuration.
   fake process is invisible in the taskbar, which is intentional.
 - **Flatpak/Snap Discord** sees `/proc` normally, so detection works, but the
   fake game must run as the same user as the Discord client.
-- **Don't fake two games at once.** Discord tracks one "current game" for the
-  activity panel and quests key off the running game list; run one at a time.
+- **You can fake several games at once.** Quest progress is driven by the
+  detected *running game list*, so multiple fake games accrue progress in
+  parallel. Only the activity panel is limited: it shows a single "current
+  game", so friends will see just one of them. Faking many is therefore fine for
+  quests, but keep it to one game if you care which name your profile shows.

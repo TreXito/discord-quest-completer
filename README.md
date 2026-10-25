@@ -79,9 +79,9 @@ Full instructions, per-distro package names and troubleshooting: [Build from sou
 > run the official client while questing. More: [docs/LINUX.md](docs/LINUX.md).
 
 > [!TIP]
-> Fake **one** game at a time. Discord tracks a single current game for the
-> activity panel, and quest progress keys off it — running several at once means
-> only one of them actually counts.
+> You can fake **several games at once** for quests: progress follows the detected
+> running-game list, so they tick in parallel. The activity panel still shows only
+> one "current game", so keep it to one if you care what your profile displays.
 
 ---
 
