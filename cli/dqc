@@ -1,0 +1,771 @@
+#!/usr/bin/env python3
+"""dqc - Discord Quest Completer, headless Linux CLI.
+
+Fakes "game is running" for any application Discord knows about, which is what
+Discord's desktop quests ("Play a game on your PC") check for.
+
+Why this works on Linux (see docs/LINUX.md for the receipts):
+
+  * Discord fetches https://cdn.discordapp.com/detectables/games-v1.json, which
+    contains 24k+ applications and every platform's executables, win32 included.
+  * The client hands *all* of those executables to discord_utils.node; the Linux
+    process observer scans /proc/<pid>/exe and matches the executable file name.
+  * So: copy the tiny runner to <executable name from the list> and run it.
+    No game, no Proton, no window.
+
+Usage:
+  dqc update                     refresh the detection database
+  dqc ls [query] [-n 25]         search applications
+  dqc info <query>               show every executable registered for an app
+  dqc play <query> [--exe NAME] [--for 15m] [--dry-run]
+  dqc stop <query> | --all
+  dqc status
+  dqc clean                      delete fake game folders for stopped games
+  dqc doctor                     check runner, database and process detection
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+GAMES_DB_URL = "https://cdn.discordapp.com/detectables/games-v1.json"
+EXCLUSIONS_URL = "https://discord.com/api/v10/games/detectable/exclusions"
+FALLBACK_DB_URL = "https://discord.com/api/v10/applications/detectable"
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+DATA = Path(os.environ.get("DQC_DATA") or DATA_HOME / "discord-quest-completer")
+GAMES_DIR = DATA / "games"
+DB_PATH = DATA / "games-v1.json"
+EXCLUSIONS_PATH = DATA / "exclusions.json"
+RUNNER_PATH = DATA / "runner" / "src-linux"
+
+RUNNER_CANDIDATES = [
+    Path(os.environ.get("DQC_RUNNER") or ""),
+    REPO_ROOT / "src-tauri" / "resources" / "src-linux",
+    REPO_ROOT / "src-linux" / "target" / "release" / "src-linux",
+    REPO_ROOT / "src-linux" / "src-linux-bin",
+]
+
+OS_RANK = {"linux": 130, "win32": 90, "darwin": 40}
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+def die(msg: str, code: int = 1) -> "NoReturn":
+    print(f"dqc: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def human_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def parse_duration(text: str) -> int:
+    text = text.strip().lower()
+    units = {"s": 1, "m": 60, "h": 3600}
+    if text and text[-1] in units:
+        try:
+            return int(float(text[:-1]) * units[text[-1]])
+        except ValueError:
+            die(f"bad duration: {text}")
+    try:
+        return int(float(text))
+    except ValueError:
+        die(f"bad duration: {text}")
+
+
+def http_get_json(url: str):
+    req = urllib.request.Request(url, headers={"User-Agent": "dqc/1.0"})
+    with urllib.request.urlopen(req, timeout=60) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def load_db(required: bool = True):
+    if not DB_PATH.exists():
+        if required:
+            die(f"no detection database at {DB_PATH}; run: dqc update")
+        return []
+    with DB_PATH.open("rb") as fh:
+        raw = json.load(fh)
+    apps = []
+    for app in raw:
+        exes = []
+        for exe in app.get("executables") or []:
+            name = exe.get("name")
+            if not name:
+                continue
+            exes.append(
+                {
+                    "name": name,
+                    "os": exe.get("os") or "",
+                    # string in games-v1.json ("-game garrysmod"), list in the API
+                    "arguments": normalize_arguments(exe.get("arguments")),
+                    "is_launcher": bool(exe.get("is_launcher")),
+                }
+            )
+        apps.append(
+            {
+                "id": str(app.get("id")),
+                "name": app.get("name") or "",
+                "aliases": app.get("aliases") or [],
+                "executables": exes,
+                "third_party_skus": app.get("third_party_skus") or [],
+            }
+        )
+    return apps
+
+
+def load_exclusions():
+    if not EXCLUSIONS_PATH.exists():
+        return set(), []
+    try:
+        with EXCLUSIONS_PATH.open("rb") as fh:
+            raw = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return set(), []
+    names = {n.lower() for n in raw.get("executables") or []}
+    return names, list(raw.get("patterns") or [])
+
+
+def is_blocked(exe_name: str, blocked: set, patterns) -> bool:
+    import re
+
+    base = exe_name.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if base in blocked:
+        return True
+    for pattern in patterns:
+        try:
+            if re.search(pattern, exe_name, re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def normalize_arguments(raw) -> str:
+    """The detectable list stores arguments as a string, the public API as a list."""
+    if isinstance(raw, str):
+        return raw.strip()
+    if isinstance(raw, (list, tuple)):
+        return " ".join(str(part) for part in raw).strip()
+    return ""
+
+
+def split_arguments(arguments: str):
+    import shlex
+
+    if not arguments:
+        return []
+    try:
+        return shlex.split(arguments)
+    except ValueError:
+        return arguments.split()
+
+
+def safe_segments(exe_name: str):
+    """Split a detectable executable name into path segments, refusing junk.
+
+    The list contains names like 'bin/x64/game.exe' and, on Linux entries,
+    things like 'Move or Die/love/linux32/love'. Anything that could escape the
+    data directory is dropped instead of sanitised so we never guess. Entries
+    like 'garden story/${garden story}.exe' are templates and are rejected.
+    """
+    if "{" in exe_name or "}" in exe_name:
+        return None
+    parts = [p for p in exe_name.replace("\\", "/").split("/") if p not in ("", ".")]
+    if not parts:
+        return None
+    for part in parts:
+        if part == ".." or "\0" in part:
+            return None
+    return parts
+
+
+def stem_of(exe_name: str) -> str:
+    base = exe_name.replace("\\", "/").rsplit("/", 1)[-1]
+    return base.rsplit(".", 1)[0] if "." in base else base
+
+
+def norm_text(text: str) -> str:
+    return "".join(ch for ch in text.lower() if ch.isalnum())
+
+
+def is_subsequence(needle: str, haystack: str) -> bool:
+    """True when every char of needle appears in haystack, in order.
+
+    'gmod' is a subsequence of 'garrysmod', 'gmad' is not. Used only to rank
+    one application's own executables against each other.
+    """
+    if not needle:
+        return False
+    it = iter(haystack)
+    return all(ch in it for ch in needle)
+
+
+# test/beta channels and crash-ish helpers make poor stand-ins for the real game
+CHANNEL_SEGMENTS = {"ptr", "beta", "demo", "test", "dev", "publictest"}
+
+
+def find_runner(auto_copy: bool = True) -> Path:
+    for candidate in RUNNER_CANDIDATES:
+        if candidate and candidate.is_file():
+            if RUNNER_PATH.exists() and RUNNER_PATH.stat().st_size == candidate.stat().st_size:
+                return RUNNER_PATH
+            if auto_copy:
+                RUNNER_PATH.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(candidate, RUNNER_PATH)
+                RUNNER_PATH.chmod(0o755)
+                return RUNNER_PATH
+            return candidate
+    if RUNNER_PATH.is_file():
+        return RUNNER_PATH
+    die(
+        "no Linux runner found. Build it first:\n"
+        "  cd src-linux && ./build.sh\n"
+        f"then re-run, or drop a binary at {RUNNER_PATH}"
+    )
+
+
+def pick_executable(app, forced: str | None, blocked: set, patterns):
+    candidates = [e for e in app["executables"] if safe_segments(e["name"])]
+    if forced:
+        needle = forced.lower()
+        match = [
+            e
+            for e in candidates
+            if e["name"].lower() == needle
+            or e["name"].replace("\\", "/").rsplit("/", 1)[-1].lower() == needle
+            or needle in e["name"].lower()
+        ]
+        if not match:
+            die(f"no executable matching {forced!r} for {app['name']}")
+        candidates = match
+    if not candidates:
+        return None
+
+    app_name = norm_text(app["name"])
+
+    def score(exe):
+        segs = safe_segments(exe["name"]) or [exe["name"]]
+        value = OS_RANK.get(exe["os"], 10)
+        if not is_blocked(exe["name"], blocked, patterns):
+            value += 30
+        if not exe["arguments"]:
+            value += 15
+        if not exe["is_launcher"]:
+            value += 5
+        # '<name>.exe' beats 'bin/util.exe' when the name is the game's own
+        stem = norm_text(stem_of(exe["name"]))
+        if len(stem) >= 3 and app_name:
+            if stem in app_name:
+                value += 45
+                if app_name.endswith(stem):
+                    value += 8
+            elif is_subsequence(stem, app_name):
+                value += 30
+        # skip test realms / betas when the live build is also registered
+        if any(norm_text(part) in CHANNEL_SEGMENTS for part in segs[:-1]):
+            value -= 12
+        # a leading marker ('>hl2.exe') is a DB hint, the plain name also exists
+        if segs[-1] and not segs[-1][0].isalnum() and segs[-1][0] != "_":
+            value -= 25
+        value -= len(segs)
+        return value
+
+    return max(candidates, key=score)
+
+
+def search(apps, query: str, limit: int = 25):
+    if not query:
+        return apps[:limit]
+    needle = query.strip().lower()
+    hits = []
+    for app in apps:
+        haystacks = [app["name"].lower(), app["id"].lower()]
+        haystacks += [a.lower() for a in app["aliases"]]
+        haystacks += [e["name"].lower() for e in app["executables"]]
+        if any(needle in h for h in haystacks):
+            hits.append(app)
+    hits.sort(key=lambda a: (not a["name"].lower().startswith(needle), a["name"]))
+    return hits[:limit]
+
+
+def resolve_app(apps, query: str, forced_exe: str | None = None):
+    # exact id first, then exact name, then substring
+    for app in apps:
+        if app["id"] == query:
+            return app
+    lowered = query.lower()
+    for app in apps:
+        if app["name"].lower() == lowered:
+            return app
+    matches = search(apps, query, limit=10)
+    if not matches:
+        die(f"no application matches {query!r} (try: dqc update)")
+    if len(matches) > 1:
+        if forced_exe:
+            matches = [a for a in matches if pick_executable(a, forced_exe, set(), [])]
+        if len(matches) > 1:
+            print(f"dqc: {len(matches)} matches for {query!r}, pick one:", file=sys.stderr)
+            for app in matches[:10]:
+                print(f"  {app['id']}  {app['name']}", file=sys.stderr)
+            raise SystemExit(2)
+    return matches[0]
+
+
+def game_dir_for(app) -> Path:
+    return GAMES_DIR / app["id"]
+
+
+def manifest_path(app) -> Path:
+    return game_dir_for(app) / ".dqc.json"
+
+
+def pid_path(app) -> Path:
+    return game_dir_for(app) / ".dqc.pid"
+
+
+def read_pid(app):
+    pid_file = pid_path(app)
+    if not pid_file.exists():
+        return None
+    try:
+        pid = int(pid_file.read_text().strip() or "0")
+    except (OSError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        pass
+    return pid
+
+
+def kill_pid(pid: int) -> bool:
+    for sig, wait in ((signal.SIGTERM, 3.0), (signal.SIGKILL, 2.0)):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            time.sleep(0.1)
+    return False
+
+
+def proc_exe_path(pid: str) -> str | None:
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return None
+
+
+def fake_games_on_disk():
+    if not GAMES_DIR.is_dir():
+        return []
+    return sorted(p for p in GAMES_DIR.iterdir() if p.is_dir())
+
+
+def running_apps():
+    out = []
+    for folder in fake_games_on_disk():
+        pid_file = folder / ".dqc.pid"
+        manifest_file = folder / ".dqc.json"
+        if not pid_file.exists():
+            continue
+        try:
+            pid = int(pid_file.read_text().strip() or "0")
+        except (OSError, ValueError):
+            continue
+        alive = True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            alive = True
+        manifest = {}
+        if manifest_file.exists():
+            try:
+                manifest = json.loads(manifest_file.read_text())
+            except (OSError, json.JSONDecodeError):
+                manifest = {}
+        manifest.update({"pid": pid, "alive": alive, "dir": str(folder)})
+        out.append(manifest)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# commands
+# --------------------------------------------------------------------------- #
+def cmd_update(args):
+    DATA.mkdir(parents=True, exist_ok=True)
+    source = GAMES_DB_URL
+    try:
+        data = http_get_json(GAMES_DB_URL)
+    except Exception as exc:  # noqa: BLE001 - any network failure falls back
+        print(f"dqc: cdn fetch failed ({exc}), trying the public API", file=sys.stderr)
+        source = FALLBACK_DB_URL
+        data = http_get_json(FALLBACK_DB_URL)
+    if not isinstance(data, list) or not data:
+        die("downloaded detection database looks empty, keeping the old one")
+    tmp = DB_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(DB_PATH)
+    print(f"saved {len(data)} applications to {DB_PATH} (from {source})")
+
+    try:
+        exclusions = http_get_json(EXCLUSIONS_URL)
+        EXCLUSIONS_PATH.write_text(json.dumps(exclusions))
+        print(
+            "saved exclusions: "
+            f"{len(exclusions.get('executables') or [])} names, "
+            f"{len(exclusions.get('patterns') or [])} patterns"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"dqc: could not refresh exclusions ({exc})", file=sys.stderr)
+
+
+def no_executable_reason(app) -> str:
+    skus = [f"{s.get('distributor')}:{s.get('id')}" for s in app["third_party_skus"] if s.get("id")]
+    if skus:
+        return "distributor match only (" + ", ".join(skus[:3]) + ")"
+    return "no desktop executable registered"
+
+
+def cmd_ls(args):
+    apps = load_db()
+    blocked, patterns = load_exclusions()
+    query = " ".join(args.query or [])
+    hits = search(apps, query, limit=args.number if not query else 200)
+    if not hits:
+        die(f"no application matches {query!r}")
+    shown = 0
+    for app in hits:
+        if shown >= args.number:
+            break
+        exe = pick_executable(app, None, blocked, patterns)
+        label = exe["name"] if exe else no_executable_reason(app)
+        state = " [running]" if read_pid(app) else ""
+        print(f"{app['id']:>20}  {app['name'][:44]:<44} {label}{state}")
+        shown += 1
+    total = len(apps)
+    print(f"\n{shown} of {total} applications shown (dqc ls <query> to search)")
+
+
+def cmd_info(args):
+    apps = load_db()
+    blocked, patterns = load_exclusions()
+    app = resolve_app(apps, " ".join(args.query))
+    print(f"{app['name']}  (id {app['id']})")
+    if app["aliases"]:
+        print(f"aliases: {', '.join(app['aliases'])}")
+    skus = [f"{s.get('distributor')}:{s.get('id')}" for s in app["third_party_skus"] if s.get("id")]
+    if skus:
+        print(f"skus: {', '.join(skus)}")
+    if not app["executables"]:
+        print(f"executables: none ({no_executable_reason(app)})")
+    else:
+        print("executables:")
+    for exe in sorted(app["executables"], key=lambda e: (-OS_RANK.get(e["os"], 0), e["name"])):
+        flags = []
+        if exe["os"] == "linux":
+            flags.append("native linux name")
+        if exe["arguments"]:
+            flags.append("needs args " + exe["arguments"])
+        if exe["is_launcher"]:
+            flags.append("launcher")
+        if is_blocked(exe["name"], blocked, patterns):
+            flags.append("BLOCKED by discord")
+        print(f"  [{exe['os'] or '?':<6}] {exe['name']}" + (f"   ({', '.join(flags)})" if flags else ""))
+    chosen = pick_executable(app, None, blocked, patterns)
+    if chosen:
+        print(f"\nwould use: {chosen['name']}")
+
+
+def cmd_play(args):
+    apps = load_db()
+    blocked, patterns = load_exclusions()
+    app = resolve_app(apps, " ".join(args.query), args.exe)
+    exe = pick_executable(app, args.exe, blocked, patterns)
+    if not exe:
+        die(
+            f"{app['name']} has nothing to fake: {no_executable_reason(app)}.\n"
+            "Discord only tracks it through a store/distributor integration, so a "
+            "process name cannot stand in for it."
+        )
+    segments = safe_segments(exe["name"])
+    if not segments:
+        die(f"refusing unsafe executable name: {exe['name']!r}")
+    if is_blocked(exe["name"], blocked, patterns) and not args.force:
+        die(
+            f"every registered executable of {app['name']} is on Discord's blocklist "
+            f"({exe['name']}). Detection will be ignored. Use --exe to pick another "
+            "name or --force to start it anyway."
+        )
+
+    folder = game_dir_for(app) / Path(*segments[:-1])
+    target = folder / segments[-1]
+    runner = find_runner()
+
+    duration = parse_duration(args.for_) if args.for_ else 0
+    if args.dry_run:
+        print(f"app      {app['name']} ({app['id']})")
+        print(f"runner   {runner}")
+        print(f"exec     {target}")
+        print(f"args     --title {app['name']} {exe['arguments']}".rstrip())
+        if duration:
+            print(f"duration {human_duration(duration)}")
+        return
+
+    existing = read_pid(app)
+    if existing:
+        die(f"{app['name']} is already faked (pid {existing}); dqc stop it first")
+
+    folder.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(runner, target)
+    target.chmod(0o755)
+
+    argv = [str(target), "--title", app["name"], *split_arguments(exe["arguments"])]
+    if duration:
+        argv += ["--duration", str(duration)]
+
+    with open(os.devnull, "wb") as devnull:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(folder),
+            stdin=devnull,
+            stdout=devnull,
+            stderr=devnull,
+            start_new_session=True,
+            close_fds=True,
+        )
+    pid_path(app).write_text(str(proc.pid))
+    manifest_path(app).write_text(
+        json.dumps(
+            {
+                "app_id": app["id"],
+                "app_name": app["name"],
+                "executable": exe["name"],
+                "executable_os": exe["os"],
+                "arguments": exe["arguments"],
+                "path": str(target),
+                "pid": proc.pid,
+                "started": int(time.time()),
+                "duration": duration,
+            },
+            indent=2,
+        )
+    )
+
+    print(f"{app['name']}: faking {exe['name']} (pid {proc.pid})")
+    print(f"  exe  {target}")
+    if exe["os"] and exe["os"] != "linux":
+        print(f"  note using the {exe['os']} name; Discord on Linux matches names, not platforms")
+    if is_blocked(exe["name"], blocked, patterns):
+        print("  warning: this name is on Discord's exclusion list, detection will be ignored")
+    if duration:
+        print(f"  auto-stops in {human_duration(duration)}")
+    else:
+        print("  stop with: dqc stop " + app["id"])
+    print(
+        "  Discord needs its detection database loaded (≈1 min after login) and "
+        "running games refresh on its own poll, usually a few seconds."
+    )
+
+
+def cmd_stop(args):
+    apps = {app["id"]: app for app in load_db(required=False)}
+    targets = []
+
+    if args.all:
+        targets = running_apps()
+        if not targets:
+            print("nothing to stop")
+            return
+    else:
+        query = " ".join(args.query)
+        if not query:
+            die("give an application or --all")
+        app = resolve_app(load_db(), query)
+        pid = read_pid(app)
+        if not pid:
+            die(f"{app['name']} is not running")
+        targets = [{"app_name": app["name"], "pid": pid, "dir": str(game_dir_for(app))}]
+
+    failures = 0
+    for entry in targets:
+        pid = int(entry["pid"])
+        ok = kill_pid(pid)
+        folder = Path(entry["dir"])
+        if ok:
+            for name in (".dqc.pid",):
+                (folder / name).unlink(missing_ok=True)
+            print(f"stopped {entry.get('app_name') or folder.name} (pid {pid})")
+        else:
+            failures += 1
+            print(f"could not stop pid {pid} ({entry.get('app_name') or folder.name})", file=sys.stderr)
+    if failures:
+        raise SystemExit(1)
+
+
+def cmd_status(args):
+    entries = running_apps()
+    if not entries:
+        print("no fake games running")
+        return
+    now = time.time()
+    for entry in entries:
+        if not entry["alive"]:
+            print(f"(stale) {entry.get('app_name') or entry['dir']} pid {entry['pid']}")
+            continue
+        started = entry.get("started") or now
+        duration = entry.get("duration") or 0
+        extra = f" / {human_duration(duration)}" if duration else ""
+        print(
+            f"{entry.get('app_name', '?')} (id {entry.get('app_id', '?')}) "
+            f"pid {entry['pid']} up {human_duration(now - started)}{extra}"
+        )
+        print(f"  {entry.get('executable', '?')} -> {entry.get('path', '?')}")
+
+
+def cmd_clean(args):
+    removed = 0
+    for folder in fake_games_on_disk():
+        if read_pid({"id": folder.name}) is not None:
+            continue
+        shutil.rmtree(folder, ignore_errors=True)
+        removed += 1
+    print(f"removed {removed} stopped game folders from {GAMES_DIR}")
+
+
+def cmd_doctor(args):
+    print(f"data dir     {DATA}")
+    print(f"database     {DB_PATH} ({'present' if DB_PATH.exists() else 'MISSING'})")
+    apps = load_db(required=False)
+    if apps:
+        exe_count = sum(len(a["executables"]) for a in apps)
+        linux_named = sum(1 for a in apps for e in a["executables"] if e["os"] == "linux")
+        print(f"             {len(apps)} applications, {exe_count} executables ({linux_named} with a linux name)")
+        age = time.time() - DB_PATH.stat().st_mtime
+        print(f"             refreshed {human_duration(age)} ago")
+    try:
+        runner = find_runner()
+        print(f"runner       {runner} ({runner.stat().st_size} bytes)")
+        out = subprocess.run([str(runner), "--help"], capture_output=True, text=True, timeout=5)
+        print(f"             self-test exit {out.returncode}: {out.stderr.strip()[:60]}")
+    except SystemExit:
+        print("runner       MISSING (cd src-linux && ./build.sh)")
+
+    discord = [p for p in Path("/proc").iterdir() if p.is_dir() and p.name.isdigit()]
+    discord_pids = []
+    for p in discord:
+        exe = proc_exe_path(p.name) or ""
+        if os.path.basename(exe).lower() in ("discord", "discord-canary", "discordptb"):
+            discord_pids.append(p.name)
+    if discord_pids:
+        print(f"discord      running (pid {', '.join(discord_pids)}), detection is driven by it")
+    else:
+        print("discord      not running; start Discord, it does the detecting")
+
+    print("\nwhat Discord can currently see (name-matched, /proc scan):")
+    blocked, patterns = load_exclusions()
+    by_name = {}
+    for app in apps:
+        for exe in app["executables"]:
+            by_name.setdefault(exe["name"].replace("\\", "/").rsplit("/", 1)[-1].lower(), app["name"])
+    found = 0
+    for p in discord:
+        exe = proc_exe_path(p.name)
+        if not exe or exe.startswith(("/bin/", "/sbin/")):
+            continue
+        base = exe.rsplit("/", 1)[-1].lower()
+        if base in by_name:
+            found += 1
+            print(f"  pid {p.name}: {exe} -> {by_name[base]}")
+    if not found:
+        print("  (nothing matched)")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="dqc",
+        description="Discord Quest Completer for Linux: fake 'playing a game' for any app Discord tracks.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_update = sub.add_parser("update", help="refresh the detection database")
+    p_update.set_defaults(func=cmd_update)
+
+    p_ls = sub.add_parser("ls", help="list or search applications")
+    p_ls.add_argument("query", nargs="*")
+    p_ls.add_argument("-n", "--number", type=int, default=25)
+    p_ls.set_defaults(func=cmd_ls)
+
+    p_info = sub.add_parser("info", help="show the executables registered for an app")
+    p_info.add_argument("query", nargs="+")
+    p_info.set_defaults(func=cmd_info)
+
+    p_play = sub.add_parser("play", help="start faking a game")
+    p_play.add_argument("query", nargs="+")
+    p_play.add_argument("--exe", help="pick a specific registered executable")
+    p_play.add_argument(
+        "--force",
+        action="store_true",
+        help="start even if Discord blocklists the executable name",
+    )
+    p_play.add_argument("--for", dest="for_", help="stop automatically, e.g. 15m, 900s, 1h")
+    p_play.add_argument("-n", "--dry-run", action="store_true", help="print the plan, do nothing")
+    p_play.set_defaults(func=cmd_play)
+
+    p_stop = sub.add_parser("stop", help="stop a fake game")
+    p_stop.add_argument("query", nargs="*")
+    p_stop.add_argument("--all", action="store_true")
+    p_stop.set_defaults(func=cmd_stop)
+
+    p_status = sub.add_parser("status", help="show fake games that are running")
+    p_status.set_defaults(func=cmd_status)
+
+    p_clean = sub.add_parser("clean", help="delete folders of stopped fake games")
+    p_clean.set_defaults(func=cmd_clean)
+
+    p_doctor = sub.add_parser("doctor", help="check runner, database and detection")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

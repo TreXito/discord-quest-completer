@@ -1,145 +1,172 @@
 import { Game } from '@/types/types';
-import { fetch, ClientOptions } from '@tauri-apps/plugin-http';
 import { tryOnMounted, useAsyncState } from '@vueuse/core';
 import { ref, watch } from 'vue';
-import { message } from '@tauri-apps/plugin-dialog'; 
+import { message } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { useGlobalState } from './app-state';
 
+/**
+ * The detection list is fetched from three places, best first:
+ *
+ *   1. `cdn.discordapp.com/detectables/games-v1.json` - the file the Discord
+ *      client itself downloads (24883 apps at the time of writing, including
+ *      every platform's executables). This is the one that matters, because it
+ *      is what the client and the quest system match running processes against.
+ *   2. the project's GitHub mirror, same data, no Discord rate limit.
+ *   3. `/applications/detectable` from the public API, a smaller older mirror.
+ *
+ * The bundled snapshot in `src/assets/gamelist.json` is only a last resort.
+ */
+export interface GameListSource {
+    key: 'cdn' | 'mirror' | 'discord' | 'bundled';
+    label: string;
+    load: () => Promise<unknown>;
+}
+
+async function invokeJson(command: string): Promise<unknown> {
+    const raw = await invoke(command);
+    return decodePayload(raw);
+}
+
+/**
+ * Rust answers with `tauri::ipc::Response`, i.e. raw bytes. Older code treated
+ * that as an array and silently fell through to the bundled list, so handle
+ * bytes, string and already-parsed JSON here.
+ */
+export function decodePayload(raw: unknown): unknown {
+    if (raw == null) return undefined;
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw === 'string') {
+        try {
+            return JSON.parse(raw);
+        } catch {
+            return undefined;
+        }
+    }
+    if (raw instanceof ArrayBuffer) {
+        try {
+            return JSON.parse(new TextDecoder('utf-8').decode(new Uint8Array(raw)));
+        } catch {
+            return undefined;
+        }
+    }
+    if (ArrayBuffer.isView(raw)) {
+        try {
+            const view = raw as ArrayBufferView;
+            return JSON.parse(new TextDecoder('utf-8').decode(view as Uint8Array));
+        } catch {
+            return undefined;
+        }
+    }
+    return raw;
+}
+
+export function isValidGameList(data: any): boolean {
+    return (
+        Array.isArray(data) &&
+        data.length > 0 &&
+        data[0] &&
+        'id' in data[0] &&
+        'name' in data[0] &&
+        'executables' in data[0]
+    );
+}
+
 export function useFetchGameList() {
     const { addLog } = useGlobalState();
-    async function fetchGameListGHMirror() {
-        addLog('Fetching game list from GitHub mirror...'); 
-        const response = await invoke('fetch_gamelist_gh_mirror');
-        return response as Game[] | unknown[] | undefined;
-    }
-    async function fetchGameListFromDiscord (){
-        addLog('Fetching game list directly from discord...'); 
-        const response = await invoke('fetch_gamelist_from_discord');
-        return response as Game[] | unknown[] | undefined;
-    };
 
-    // const fetchBundledGameList = fetch(window.location.origin+'/gamelist.json', { method: 'GET' });
+    const sources: GameListSource[] = [
+        { key: 'cdn', label: 'Discord detection list', load: () => invokeJson('fetch_gamelist_from_cdn') },
+        { key: 'mirror', label: 'GitHub mirror', load: () => invokeJson('fetch_gamelist_gh_mirror') },
+        { key: 'discord', label: 'Discord API', load: () => invokeJson('fetch_gamelist_from_discord') },
+    ];
 
-    const { 
-        state: gameListGHMirror,
-        error: errorGH,
-        isReady: isReadyGH,
-        execute: executeGH,
-        isLoading: isLoadingGH
-    } = useAsyncState<Game[] | unknown[] | undefined>(fetchGameListGHMirror, [], {
-            immediate: false,
-            resetOnExecute: true,
-        });
-    const { 
-        state: gameListFromDiscord, 
-        error: errorDiscord,
-        isReady: isReadyDiscord,
-        execute: executeDiscord,
-        isLoading: isLoadingDiscord
-    } = useAsyncState(fetchGameListFromDiscord, [], {
-        immediate: false,
-        resetOnExecute: true,
-    });
-    const { 
-        state: bundledGameList,
-        error: errorBundled,
-        isReady: isReadyBundled,
-        execute: executeBundled,
-        isLoading: isLoadingBundled
-    } = useAsyncState(() => {
-        const result = import('../assets/gamelist.json').then(res=>res.default);
-        addLog('Fetching bundled game list for fallback...');
-        return result;
-    }, [], {
-        immediate: false,
-        resetOnExecute: true,
-    });
+    // the bundled snapshot is imported synchronously and always available
+    const bundled = useAsyncState(
+        () => {
+            addLog('Fetching bundled game list for fallback...');
+            return import('../assets/gamelist.json').then(res => res.default as unknown as Game[]);
+        },
+        [],
+        { immediate: false, resetOnExecute: true }
+    );
+
+    const cdn = useAsyncState<unknown>(sources[0].load, undefined, { immediate: false, resetOnExecute: true });
+    const mirror = useAsyncState<unknown>(sources[1].load, undefined, { immediate: false, resetOnExecute: true });
+    const discord = useAsyncState<unknown>(sources[2].load, undefined, { immediate: false, resetOnExecute: true });
 
     const fetchError = ref<string | null>(null);
-
     const gameDB = ref<Game[]>([]);
-
     const allFetchDone = ref(false);
+    const gameListSource = ref<GameListSource['key'] | null>(null);
 
-    function isValidGameList(data: any): boolean {
-        return Array.isArray(data) && data[0] && 'aliases' in data[0] && 'name' in data[0] && 'executables' in data[0];
+    async function trySource(
+        state: typeof cdn,
+        key: GameListSource['key'],
+        label: string
+    ): Promise<Game[] | null> {
+        try {
+            await state.execute();
+        } catch (error) {
+            addLog('debug', `${label} failed: ${String(error)}`);
+            return null;
+        }
+        const data = state.state.value;
+        if (isValidGameList(data)) {
+            const list = data as Game[];
+            addLog('info', `${label}: ${list.length} applications.`);
+            gameListSource.value = key;
+            return list;
+        }
+        addLog('debug', `${label} returned unusable data.`);
+        return null;
     }
 
-    watch(() => isReadyGH.value, async (newVal) => {
-        addLog('debug','isReadyGH: ' + newVal); 
-    });
-
-    watch(() => isReadyDiscord.value, async (newVal) => {
-        addLog('debug','isReadyDiscord: ' + newVal);
-    })
-    
-    watch(() => isReadyBundled.value, async (newVal) => {
-        addLog('debug','isReadyBundled: ' + newVal); 
-    });
-
-    let timeoutId: ReturnType<typeof setTimeout> | null = null;
-    async function fetchGameList() { 
+    async function fetchGameList() {
         allFetchDone.value = false;
-        addLog('Fetching game list...');
-        // try fetching from the Github mirror first, then Discord. Use bundled as fallback.
-        try {
-           await Promise.all([executeGH(), executeBundled()]);
-        } catch {
-            addLog('error', 'Error executing fetch for GitHub mirror or bundled game list.');
-        }
+        fetchError.value = null;
+        gameListSource.value = null;
 
-        if (errorGH.value) { 
-            fetchError.value = 'Error fetching game list from GitHub mirror.';
-            addLog('error','Error fetching game list from GitHub mirror');
-            await executeDiscord();
-            if (errorDiscord.value) {
-                fetchError.value = 'Error fetching game list from Discord.';
-                addLog('error','Error fetching game list from Discord:');
-                if (errorBundled.value) {
-                    fetchError.value = 'Error fetching bundled game list.';
-                    addLog('error','Error fetching bundled game list:');
-                }
+        // bundled is local, start it so the UI has something either way
+        const bundledPromise = bundled.execute().catch(() => undefined);
+
+        let list = await trySource(cdn, 'cdn', 'Discord detection list');
+        if (!list) list = await trySource(mirror, 'mirror', 'GitHub mirror');
+        if (!list) list = await trySource(discord, 'discord', 'Discord API');
+
+        if (!list) {
+            await bundledPromise;
+            if (isValidGameList(bundled.state.value)) {
+                list = bundled.state.value as Game[];
+                gameListSource.value = 'bundled';
+                addLog('warning', `Using bundled game list: ${list.length} applications (may be stale).`);
             }
         }
-        // silently log error for bundled, as it's the last resort.
-        if (errorBundled.value) {
-            addLog('error','Error fetching bundled game list');
-        }
 
-        if (fetchError.value) {
-            await message('There was an error fetching the latest game list.' + fetchError.value, {
+        if (!list) {
+            fetchError.value = 'No game list could be loaded (network and bundled list both failed).';
+            addLog('error', fetchError.value);
+            await message(fetchError.value, {
                 title: 'Game List Fetch Error',
                 kind: 'error',
-                buttons: {
-                    ok: 'OK'
-                }
+                buttons: { ok: 'OK' },
             });
-        }
-
-        if (gameListGHMirror.value && gameListGHMirror.value?.length > 0 && isValidGameList(gameListGHMirror.value)) {
-            gameDB.value = gameListGHMirror.value as Game[] || [];
-            addLog('Using game list from GitHub mirror. ' + gameListGHMirror.value.length + ' entries.');
-        } else if (gameListFromDiscord.value && gameListFromDiscord.value?.length > 0 && isValidGameList(gameListFromDiscord.value)) {
-            gameDB.value = gameListFromDiscord.value as Game[] || [];
-            addLog('Using game list from Discord. ' + gameListFromDiscord.value.length + ' entries.');
-        } else {
-            // bundled is always present.
-            addLog('Using bundled game list as fallback.' + bundledGameList.value.length + ' entries.');
-            gameDB.value = bundledGameList.value;
-        }
-
-        // Set a timeout to delay setting allFetchDone to true, to allow UI to update.
-      
-        timeoutId = setTimeout(() => {
             allFetchDone.value = true;
-        }, 1800);
+            return;
+        }
 
+        gameDB.value = list;
+        addLog('info', `Game database ready: ${list.length} applications (${gameListSource.value}).`);
+
+        // let the notifications breathe for a moment before hiding the panel
+        setTimeout(() => {
+            allFetchDone.value = true;
+        }, 1200);
     }
 
-    watch(allFetchDone, (newVal) => {
-        if (newVal && timeoutId) {
-            clearTimeout(timeoutId);
+    watch(allFetchDone, value => {
+        if (value) {
+            addLog('debug', 'game list fetch finished');
         }
     });
 
@@ -147,20 +174,21 @@ export function useFetchGameList() {
         await fetchGameList();
     });
 
-
     return {
-        gameListGHMirror,
-        gameListFromDiscord,
-        bundledGameList,
-        fetchError,
-        isReadyGH,
-        isReadyDiscord,
-        isReadyBundled,
         gameDB,
+        gameListSource,
+        fetchError,
         fetchGameList,
-        isLoadingGH,
-        isLoadingDiscord,
-        isLoadingBundled,
-        allFetchDone
-    }
+        allFetchDone,
+        // primary source (cdn, with the mirror and the API as fallbacks)
+        isReadyPrimary: cdn.isReady,
+        isLoadingPrimary: cdn.isLoading,
+        // kept for the status panel
+        isReadyGH: mirror.isReady,
+        isLoadingGH: mirror.isLoading,
+        isReadyDiscord: discord.isReady,
+        isLoadingDiscord: discord.isLoading,
+        isReadyBundled: bundled.isReady,
+        isLoadingBundled: bundled.isLoading,
+    };
 }

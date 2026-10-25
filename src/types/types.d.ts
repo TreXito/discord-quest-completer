@@ -3,6 +3,8 @@ export interface GameExecutable {
   is_launcher: boolean;
   name: string;
   os: string;
+  /** required command line arguments, a single string in Discord's list */
+  arguments?: string;
   filename?: string;
   path?: string;
   segments?: number;

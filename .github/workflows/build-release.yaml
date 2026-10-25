@@ -21,6 +21,13 @@ jobs:
           - platform: 'windows-latest'
             args: ''
             x-target: 'win32-x64'
+            artifact: 'tauri-win-release'
+          # Linux: same Tauri app, plus the tiny name-only runner. The runner is
+          # built by src-linux/build.sh (cargo, or cc as a fallback).
+          - platform: 'ubuntu-22.04'
+            args: ''
+            x-target: 'linux-x86_64'
+            artifact: 'tauri-linux-release'
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -86,6 +93,23 @@ jobs:
         with:
           workspaces: './src-tauri -> target'
     
+      - name: install linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
+            file
+
+      - name: Build src-linux runner
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          chmod +x ./src-linux/build.sh
+          sh ./src-linux/build.sh --copy
+          ls -l ./src-tauri/resources/src-linux
+
       - name: install frontend dependencies
         run: pnpm install
 
@@ -99,8 +123,9 @@ jobs:
         id: create_artifact_for_release
         uses: actions/upload-artifact@v4
         with:
-          name: tauri-win-release
+          name: ${{ matrix.artifact }}
           path: |
+            src-tauri/target/release/discord-quest-completer
             src-tauri/target/release/discord-quest-completer.exe
             src-tauri/target/release/bundle/
             src-tauri/target/release/data/
@@ -122,6 +147,24 @@ jobs:
         with:
           name: tauri-win-release
           path: tauri-win-release
+
+      - name: Download linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tauri-linux-release
+          path: tauri-linux-release
+
+      - name: prepare linux files
+        env:
+          version: ${{ env.version }}
+          linux_build_release_dir: discord-quest-completer-linux-x86_64-${{ env.version }}
+        run: |
+          mkdir -p ./build/${{ env.linux_build_release_dir }}
+          cp tauri-linux-release/discord-quest-completer ./build/${{ env.linux_build_release_dir }}/
+          cp -r tauri-linux-release/data/ ./build/${{ env.linux_build_release_dir }}/
+          chmod +x ./build/${{ env.linux_build_release_dir }}/discord-quest-completer
+          tar -czf ./build/${{ env.linux_build_release_dir }}.tar.gz -C ./build ${{ env.linux_build_release_dir }}
+          echo "linux_build_release_dir=${{ env.linux_build_release_dir }}" >> $GITHUB_ENV
 
       - name: prepare files
         env:
@@ -162,6 +205,7 @@ jobs:
           generate_release_notes: true
           files: |
             ./build/${{ env.win_build_release_dir }}.zip
+            ./build/${{ env.linux_build_release_dir }}.tar.gz
           prerelease: true
           draft: true
         env:

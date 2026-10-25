@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, useTemplateRef, shallowRef, provide, nextTick, triggerRef } from 'vue';
+import { ref, computed, useTemplateRef, shallowRef, provide, nextTick, triggerRef, watch } from 'vue';
 // import gameListData from '../assets/gamelist.json';
 import { onClickOutside, refDebounced, tryOnMounted } from '@vueuse/core';
 import { useFuse } from '@vueuse/integrations/useFuse'
@@ -28,6 +28,9 @@ type DialogKey =
 
 const {
     gameDB,
+    gameListSource,
+    isLoadingPrimary,
+    isReadyPrimary,
     isLoadingBundled,
     isLoadingDiscord,
     isLoadingGH,
@@ -39,8 +42,8 @@ const {
 } = useFetchGameList()
 const { addLog } = useGlobalState();
 const shouldShowNotificationContainer = computed(() => {
-    return isLoadingGH.value || isLoadingDiscord.value || isLoadingBundled.value ||
-           (isReadyGH.value || isReadyDiscord.value || isReadyBundled.value);
+    return isLoadingPrimary.value || isLoadingGH.value || isLoadingDiscord.value || isLoadingBundled.value ||
+           (isReadyPrimary.value || isReadyGH.value || isReadyDiscord.value || isReadyBundled.value);
 });
 
 const dialogRef = useTemplateRef<HTMLDialogElement>('dialogRef');
@@ -204,6 +207,8 @@ async function createDummyGame(game: Game | null, executable: GameExecutable) {
             path_len: executable.segments,
             app_id: Number(gameToInstall.id),
             display_name: gameToInstall.name,
+            // some detectable entries are only matched together with arguments
+            arguments: executableItem.arguments ?? '',
         }
         console.log(payload);
         const result = await invoke('create_fake_game', payload)
@@ -249,6 +254,7 @@ async function playGame({game, executable}: {game: Game, executable: GameExecuta
                 path_len: executable.segments,
                 app_id: Number(gameToPlay.id),
                 exec_path: path.join(executable.path!, executable.filename!),
+                arguments: executableItem.arguments ?? '',
             } 
             await invoke('run_background_process', payload);
             gameToPlay.is_running = true;
@@ -276,7 +282,9 @@ async function stopPlaying({game, executable}: {game: Game, executable: GameExec
     if (gameToPlay && executableItem) {
         try {
             await invoke('stop_process', {
-                exec_name: executable.filename!
+                exec_name: executable.filename!,
+                app_id: Number(gameToPlay.id),
+                path: executable.path ?? '',
             })
             addLog('info', `Stopped game process: ${game.name}`);
             addLog('info', `Stopped Executable: ${executable.name}`);
@@ -376,6 +384,47 @@ function hideDialog() {
 }
 
 
+/**
+ * Rebuild "installed / running" from what is actually on disk.
+ *
+ * The games folder outlives the app, and the fake game keeps running after the
+ * window closes, so without this a restart shows a running quest game as
+ * "install" again and you end up with two copies of the same fake process.
+ */
+async function restoreFakeGamesState() {
+    try {
+        const entries = await invoke<Array<Record<string, any>>>('list_fake_games');
+        if (!Array.isArray(entries) || entries.length === 0) {
+            return;
+        }
+        for (const entry of entries) {
+            const id = String(entry?.app_id ?? '');
+            const target = gameList.value.find(g => String(g.id) === id)
+                ?? gameDB.value.find(g => String(g.id) === id);
+            if (!target) continue;
+            target.is_installed = true;
+            target.is_running = !!entry.running;
+            const exe = target.executables?.find(e => e.name === entry.executable);
+            if (exe) {
+                exe.is_installed = true;
+                exe.is_running = !!entry.running;
+            }
+            if (entry.running) {
+                currentlyPlaying.value = target.id;
+            }
+        }
+        addLog('info', `Restored ${entries.length} fake game(s) from disk.`);
+    } catch (error) {
+        addLog('debug', 'Could not read existing fake games: ' + String(error));
+    }
+}
+
+watch(() => gameDB.value.length, (count) => {
+    if (count > 0) {
+        void restoreFakeGamesState();
+    }
+}, { immediate: true });
+
 provide<GameActionsProvider>(GameActionsKey, {
     canPlayGame,
     isGameInstalled,
@@ -456,17 +505,17 @@ provide<GameActionsProvider>(GameActionsKey, {
                     enter-from-class="opacity-0 translate-y-2 ease-in-out"
                     enter-to-class="opacity-100 translate-y-0 ease-in-out"
                 >
-                    <div v-if="isLoadingGH" class="text-sm text-gray-500 dark:text-gray-400">
-                        Fetching game list from GitHub mirror... 
+                    <div v-if="isLoadingPrimary" class="text-sm text-gray-500 dark:text-gray-400">
+                        Fetching Discord's detection list... 
                       <div class="border-full h-2 w-2 bg-green-500 rounded-full inline-block ml-2 animate-pulse"></div>
                     </div>
                 </Transition>
                 <TimedNotification
-                    :is-ready="isReadyGH" 
+                    :is-ready="isReadyPrimary" 
                     :duration="1500"
                     container-class="text-sm text-gray-500 dark:text-gray-400"
                 > 
-                    Game list from mirror fetched <span class="text-green-400">✓</span>
+                    Detection list fetched <span class="text-green-400">✓</span>
                 </TimedNotification>
 
                 <!-- Fetching from Discord loading indicator -->
@@ -477,7 +526,7 @@ provide<GameActionsProvider>(GameActionsKey, {
                     enter-to-class="opacity-100 translate-y-0 ease-in-out"
                 >
                     <div v-if="isLoadingDiscord" class="text-sm text-gray-500 dark:text-gray-400">
-                        Fetching game list directly from Discord...
+                        Trying the Discord API...
                         <div class="border-full h-2 w-2 bg-green-500 rounded-full inline-block ml-2 animate-pulse"></div>
                     </div>
                 </Transition>

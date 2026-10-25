@@ -26,3 +26,7 @@ export function getCurrentOS(): string {
 export function isMacOS(): boolean {
     return getCurrentOS() === EXECUTABLE_OS.DARWIN;
 }
+
+export function isLinux(): boolean {
+    return getCurrentOS() === EXECUTABLE_OS.LINUX;
+}

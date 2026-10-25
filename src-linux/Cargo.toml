@@ -1,17 +1,17 @@
 [package]
 name = "src-linux"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+description = "Minimal Linux dummy game runner for Discord Quest Completer"
 
-[dependencies]
-gtk4 = "0.7"
-glib = "0.18"
-open = "5.0"
+[build-dependencies]
+cc = "1.0"
 
 [[bin]]
 name = "src-linux"
 path = "src/main.rs"
 
+# Tiny binary on purpose: it gets copied once per fake game.
 [profile.release]
 opt-level = "z"
 lto = true
@@ -20,4 +20,4 @@ panic = "abort"
 strip = true
 overflow-checks = false
 debug = false
-rpath = false
+incremental = false
