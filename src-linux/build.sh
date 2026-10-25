@@ -1,14 +1,15 @@
 #!/bin/sh
 # Build the Linux dummy game runner.
 #
-#   ./build.sh                -> target/release/src-linux (cargo) or src-linux-bin (cc)
+#   ./build.sh                -> src-linux-bin (cc) or target/release/src-linux (cargo)
 #   ./build.sh --copy         -> also drop it in ../src-tauri/resources/src-linux
-#   FORCE_CC=1 ./build.sh     -> skip cargo, use the system C compiler
+#   FORCE_CC=1 ./build.sh     -> cc only, no cargo fallback
+#   FORCE_CARGO=1 ./build.sh  -> cargo first (what CI used historically)
 #
-# Cargo is preferred because CI and the Windows runner use it, but the runner is
-# plain C, so a machine with only gcc can still build it. Either way the result
-# is a ~15KB binary that links nothing but libc: it gets copied once per fake
-# game, so size is the whole point.
+# cc is preferred on Linux: the whole point of this binary is that it is a tiny
+# libc-only blob (a copy is made once per fake game), and a C build gives ~11KB
+# while the Rust wrapper is ~265KB and additionally links libgcc_s. Cargo is kept
+# as the fallback for machines without a C compiler, since the runner is plain C.
 set -eu
 
 cd "$(dirname "$0")"
@@ -53,10 +54,12 @@ try_cc() {
     OUT=src-linux-bin
 }
 
-if [ "${FORCE_CC:-0}" = "1" ]; then
+if [ "${FORCE_CARGO:-0}" = "1" ]; then
+    try_cargo || try_cc
+elif [ "${FORCE_CC:-0}" = "1" ]; then
     try_cc
 else
-    try_cargo || try_cc
+    try_cc || try_cargo
 fi
 
 echo "built: $(pwd)/$OUT ($(wc -c <"$OUT") bytes)"

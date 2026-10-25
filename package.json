@@ -1,7 +1,7 @@
 {
   "name": "tauri-app",
   "private": true,
-  "version": "25.10.7",
+  "version": "25.10.25",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -16,8 +16,9 @@
     "copy:runner:darwin": "cp ./src-darwin/target/release/src-darwin ./src-tauri/resources/src-darwin",
     "sync:runner": "node scripts/sync-runner.mjs",
     "tauri:dev": "tauri dev",
-    "build:linux": "pnpm build:runner:linux && pnpm copy:runner:linux && tauri build",
-    "dqc": "python3 ./cli/dqc"
+    "build:linux": "sh ./scripts/build-linux.sh",
+    "dqc": "python3 ./cli/dqc",
+    "install:linux": "sh ./install.sh --local --with-gui"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.1.3",

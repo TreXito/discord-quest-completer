@@ -2,6 +2,9 @@ name: 'publish'
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
@@ -109,11 +112,25 @@ jobs:
           chmod +x ./src-linux/build.sh
           sh ./src-linux/build.sh --copy
           ls -l ./src-tauri/resources/src-linux
+          # the runner is copied once per fake game, so it must stay the tiny
+          # libc-only C build and not the ~265KB cargo/rustc wrapper
+          size=$(wc -c < ./src-tauri/resources/src-linux)
+          echo "runner size: $size bytes"
+          [ "$size" -lt 100000 ] || { echo "runner too big ($size bytes): expected the cc build"; exit 1; }
 
       - name: install frontend dependencies
         run: pnpm install
 
+      # Linux builds through scripts/build-linux.sh: it retries the AppImage step
+      # with NO_STRIP=1, which newer binutils (Fedora 41+ / .relr.dyn) needs
+      # because linuxdeploy's bundled strip cannot parse those libraries.
+      - name: Build Linux bundles (deb + AppImage)
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        run: sh ./scripts/build-linux.sh
+
       - uses: tauri-apps/tauri-action@v0
+        if: matrix.platform != 'ubuntu-22.04'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -131,14 +148,54 @@ jobs:
             src-tauri/target/release/data/
             src-tauri/target/release/resources/
 
+  # The headless CLI is the shortest path to a working quest, so it gets its own
+  # self-contained artifact: dqc (one Python file) + the ~11KB runner, no Tauri.
+  cli-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the runner (cc, libc only)
+        run: |
+          chmod +x ./src-linux/build.sh
+          ./src-linux/build.sh
+          size=$(wc -c < ./src-linux/src-linux-bin)
+          echo "runner: $size bytes"
+          [ "$size" -lt 100000 ] || { echo "expected the ideal-cc build, got $size bytes"; exit 1; }
+          ldd ./src-linux/src-linux-bin
+          ./src-linux/src-linux-bin --help
+
+      - name: Package dqc + runner
+        run: |
+          mkdir -p ./dist
+          install -m 0755 ./cli/dqc ./dist/dqc
+          install -m 0755 ./src-linux/src-linux-bin ./dist/src-linux
+          cp ./install.sh ./dist/install.sh
+          cp ./LICENSE ./dist/LICENSE
+          tar -czf ./dist/discord-quest-completer-cli-linux-x86_64.tar.gz -C ./dist dqc src-linux install.sh LICENSE
+          cd ./dist && sha256sum discord-quest-completer-cli-linux-x86_64.tar.gz > cli-SHA256SUMS.txt && cat cli-SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-linux-release
+          path: |
+            dist/discord-quest-completer-cli-linux-x86_64.tar.gz
+            dist/cli-SHA256SUMS.txt
+
   release:
-    needs: build-tauri
+    needs: [build-tauri, cli-linux]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: get version
         id: extract_version
         run: |
-          version=$(date +"%Y.%m.%d")
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version=$(date +"%Y.%m.%d")
+          fi
           echo "version=$version" >> $GITHUB_ENV
         shell: bash
 
@@ -154,6 +211,12 @@ jobs:
           name: tauri-linux-release
           path: tauri-linux-release
 
+      - name: Download cli artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-linux-release
+          path: cli-linux
+
       - name: prepare linux files
         env:
           version: ${{ env.version }}
@@ -161,10 +224,21 @@ jobs:
         run: |
           mkdir -p ./build/${{ env.linux_build_release_dir }}
           cp tauri-linux-release/discord-quest-completer ./build/${{ env.linux_build_release_dir }}/
-          cp -r tauri-linux-release/data/ ./build/${{ env.linux_build_release_dir }}/
+          [ -d tauri-linux-release/data ] && cp -r tauri-linux-release/data ./build/${{ env.linux_build_release_dir }}/ || true
           chmod +x ./build/${{ env.linux_build_release_dir }}/discord-quest-completer
           tar -czf ./build/${{ env.linux_build_release_dir }}.tar.gz -C ./build ${{ env.linux_build_release_dir }}
           echo "linux_build_release_dir=${{ env.linux_build_release_dir }}" >> $GITHUB_ENV
+
+      - name: collect installable linux assets (space-free names)
+        run: |
+          set -eux
+          cp cli-linux/discord-quest-completer-cli-linux-x86_64.tar.gz ./build/
+          cp src-tauri/icons/128x128.png ./build/icon-128.png
+          deb=$(find tauri-linux-release -name '*.deb' | head -1)
+          appimage=$(find tauri-linux-release -name '*.AppImage' | head -1)
+          [ -n "$deb" ] && cp "$deb" ./build/discord-quest-completer-linux-x86_64.deb
+          [ -n "$appimage" ] && cp "$appimage" ./build/discord-quest-completer-linux-x86_64.AppImage
+          cd ./build && sha256sum *.deb *.AppImage *.tar.gz icon-128.png > SHA256SUMS.txt && cat SHA256SUMS.txt
 
       - name: prepare files
         env:
@@ -193,9 +267,19 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.version }}
-          name: Pre-Release ${{ env.version }}
+          name: ${{ env.version }}
           body: |
-            ![GitHub Downloads (specific asset, specific tag)](https://img.shields.io/github/downloads/markterence/discord-quest-completer/${{ env.version }}/${{ env.win_build_release_dir }}.zip)
+            ## Linux quick start
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/TreXito/discord-quest-completer-linux/main/install.sh | sh
+            dqc play overwatch --for 15m
+            ```
+
+            Assets: `...-cli-linux-x86_64.tar.gz` (headless CLI, no deps), `....deb`,
+            `....AppImage` (GUI), `...linux-x86_64-<date>.tar.gz` (portable GUI tarball).
+            Checksums in `SHA256SUMS.txt`. Requires the **official** Discord desktop client.
+            ![GitHub Downloads](https://img.shields.io/github/downloads/TreXito/discord-quest-completer-linux/${{ env.version }}/total)
 
             #### Disclaimer
             This tool is intended for educational purposes and personal use. Please respect Discord's terms of service and game publishers' rights when using this application.  
@@ -206,8 +290,15 @@ jobs:
           files: |
             ./build/${{ env.win_build_release_dir }}.zip
             ./build/${{ env.linux_build_release_dir }}.tar.gz
-          prerelease: true
-          draft: true
+            ./build/discord-quest-completer-linux-x86_64.deb
+            ./build/discord-quest-completer-linux-x86_64.AppImage
+            ./build/discord-quest-completer-cli-linux-x86_64.tar.gz
+            ./build/icon-128.png
+            ./build/SHA256SUMS.txt
+          # tag pushes publish a real release; manual runs stay a draft
+          prerelease: false
+          draft: ${{ github.event_name != 'push' }}
+          fail_on_unmatched_files: false
         env:
           version: ${{ env.version }}
           win_build_release_dir: ${{ env.win_build_release_dir }}

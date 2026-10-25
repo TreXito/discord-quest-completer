@@ -1,12 +1,14 @@
 <p>
-  <h1 align="center">Discord Quest Completer</h1>
+  <h1 align="center">Discord Quest Completer — Linux</h1>
 </p>
 
-![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/markterence/discord-quest-completer/build-release.yaml?branch=main&style=flat&label=build%20(release))
-[![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/markterence/discord-quest-completer/rust-check.yml?branch=main&style=flat&label=scheduled%20build%20%28every%202%20days%29)](https://github.com/markterence/discord-quest-completer/actions/workflows/rust-check.yml?query=branch%3Amain+event%3Aschedule)
+![Linux release](https://img.shields.io/github/actions/workflow/status/TreXito/discord-quest-completer-linux/build-release.yaml?branch=main&style=flat&label=build%20%28release%29)
+[![Latest release](https://img.shields.io/github/v/release/TreXito/discord-quest-completer-linux?style=flat&label=latest%20release)](https://github.com/TreXito/discord-quest-completer-linux/releases)
+[![Linux x86_64](https://img.shields.io/badge/platform-linux%20x86__64-informational?style=flat)](#-supported-platforms)
 
 
-> A quest completer for Discord. Discord Quest Completer. I don't know what to call this, but there it is.
+> A quest completer for Discord, working on Linux: complete "play a game on your PC"
+> quests without downloading the games.
 
 A Windows desktop application for Discord Rich Presence and completing Discord Quest for games without needing to install the full actual games/applications. Perfect for completing Discord Quests and showing off your gaming status without the storage burden.
 
@@ -27,29 +29,59 @@ https://github.com/user-attachments/assets/de904123-07df-41a9-8db1-ff05cc7ccc9b
 
 ## ⚡ Quick start
 
-**Linux, headless (nothing to compile, needs only `python3`):**
+**Linux, one line (CLI only — no Rust, no WebKit, no compile):**
 
 ```bash
-git clone https://github.com/TreXito/discord-quest-completer
-cd discord-quest-completer
+curl -fsSL https://raw.githubusercontent.com/TreXito/discord-quest-completer-linux/main/install.sh | sh
+
+dqc update                 # fetch Discord's detection list
+dqc play overwatch --for 15m
+dqc status
+dqc stop --all
+```
+
+That puts `dqc` in `~/.local/bin` and the ~11 KB runner in
+`~/.local/share/discord-quest-completer/runner/`, so it works from any directory.
+Add `--with-gui` to also install the desktop app and a menu entry. Uninstall with
+`install.sh --uninstall`.
+
+**Linux, headless from a checkout (needs only `python3`):**
+
+```bash
+git clone https://github.com/TreXito/discord-quest-completer-linux
+cd discord-quest-completer-linux
 ./cli/dqc update
 ./cli/dqc play "elden ring" --for 15m
 ./cli/dqc status
 ```
 
-**Linux, GUI (compiles the Tauri app, ~3 minutes):**
+**Linux, GUI (compiles the Tauri app, ~2-3 minutes):**
 
 ```bash
 sudo dnf install webkit2gtk4.1-devel gtk3-devel libappindicator-gtk3-devel \
                  librsvg2-devel patchelf libsoup3-devel javascriptcoregtk4.1-devel \
                  gcc gcc-c++ make pkgconf-pkg-config
-corepack enable                     # provides pnpm, or: npm i -g pnpm
+npm i -g pnpm                       # or: corepack enable
 pnpm install
 pnpm build:linux                    # runner + frontend + tauri release bundle
 ./src-tauri/target/release/discord-quest-completer
 ```
 
 Full instructions, per-distro package names and troubleshooting: [Build from source](#-build-from-source).
+
+> [!IMPORTANT]
+> **Use the official Discord desktop client.** Detection is done by the client:
+> it scans `/proc` and matches executable names against its own
+> `games-v1.json`, which it downloads ~1 minute after login. Third-party clients
+> (Vesktop, ArmCord, web builds) ship no `discord_utils.node` detection module,
+> so a fake game is *never* seen there — their activity panel can still show
+> something via RPC, which makes it look like it works. Keep them for chatting;
+> run the official client while questing. More: [docs/LINUX.md](docs/LINUX.md).
+
+> [!TIP]
+> Fake **one** game at a time. Discord tracks a single current game for the
+> activity panel, and quest progress keys off it — running several at once means
+> only one of them actually counts.
 
 ---
 
@@ -307,8 +339,8 @@ sudo pacman -S webkit2gtk-4.1 gtk3 libappindicator-gtk3 librsvg patchelf libsoup
 ### 🛠️ Build
 
 ```bash
-git clone https://github.com/TreXito/discord-quest-completer
-cd discord-quest-completer
+git clone https://github.com/TreXito/discord-quest-completer-linux
+cd discord-quest-completer-linux
 pnpm install
 pnpm build:linux
 ```
@@ -371,6 +403,10 @@ pnpm tauri dev          # or: pnpm tauri build
 | AppImage will not start (`libfuse.so.2`) | `sudo dnf install fuse-libs`, or run it with `--appimage-extract-and-run` |
 | Game never shows up in Discord | Discord needs its detection list (~1 min after login). Check with `./cli/dqc doctor`; some names are blocklisted by Discord and the tool warns about those |
 | `dqc: no Linux runner found` | build the runner once: `cd src-linux && ./build.sh --copy`, or let it auto-pick `src-tauri/resources/src-linux` |
+| `failed to bundle project: failed to run linuxdeploy` / `Strip call failed: ... .relr.dyn` | newer binutils (Fedora 41+, glibc with `.relr.dyn`) breaks linuxdeploy's bundled `strip`. `NO_STRIP=1 pnpm exec tauri build` — `scripts/build-linux.sh` already retries the bundle this way automatically. The `.deb` and the plain binary are built before this step. |
+| Quest never progresses, but `Test RPC` shows the game | you are on a third-party client (Vesktop/ArmCord/web). Those ship no `discord_utils.node`, so nothing scans `/proc`; RPC presence is cosmetic and quests ignore it. Use the official desktop client. |
+| `dqc status` says running but Discord shows nothing | check `dqc doctor` -> "what Discord can currently see"; then confirm the official client is running (`pgrep -f app-1.0.166/Discord`) and give it ~1 min after login for `games-v1.json`. |
+| Runner is ~265 KB instead of ~11 KB | it was built through cargo, so it is the Rust wrapper and links `libgcc_s`. `cd src-linux && FORCE_CC=1 ./build.sh --copy` gives the libc-only C build (the default now). |
 
 ### 🗂️ Where the game list comes from
 
