@@ -132,6 +132,7 @@ FORCE_CC=1 ./build.sh                # force the C compiler
 ./cli/dqc update                     # fetch the detection list + blocklist
 ./cli/dqc ls                         # first 25 applications and their exe
 ./cli/dqc ls terraria                # search by name, alias or executable
+./cli/dqc ls --playable              # hide distributor-only / no-exec entries
 ./cli/dqc info "elden ring"          # every registered executable + which one it would use
 ./cli/dqc play "elden ring"          # start faking it
 ./cli/dqc play overwatch --for 15m   # auto-stop after a 15 minute quest

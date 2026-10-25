@@ -464,8 +464,15 @@ def cmd_ls(args):
     apps = load_db()
     blocked, patterns = load_exclusions()
     query = " ".join(args.query or [])
+    if getattr(args, "playable", False):
+        apps = [a for a in apps if pick_executable(a, None, blocked, patterns)]
+    if not apps:
+        die("no fakeable applications in the database (dqc update?)")
     hits = search(apps, query, limit=args.number if not query else 200)
     if not hits:
+        if getattr(args, "playable", False):
+            die(f"nothing fakeable matches {query!r} (drop --playable to see"
+                " distributor-only / no-executable entries)")
         die(f"no application matches {query!r}")
     shown = 0
     for app in hits:
@@ -477,7 +484,8 @@ def cmd_ls(args):
         print(f"{app['id']:>20}  {app['name'][:44]:<44} {label}{state}")
         shown += 1
     total = len(apps)
-    print(f"\n{shown} of {total} applications shown (dqc ls <query> to search)")
+    hint = " (only fakeable ones shown)" if getattr(args, "playable", False) else ""
+    print(f"\n{shown} of {total} applications shown{hint} (dqc ls <query> to search)")
 
 
 def cmd_info(args):
@@ -727,6 +735,9 @@ def build_parser():
     p_ls = sub.add_parser("ls", help="list or search applications")
     p_ls.add_argument("query", nargs="*")
     p_ls.add_argument("-n", "--number", type=int, default=25)
+    p_ls.add_argument("--playable", action="store_true",
+                      help="only applications that can actually be faked (skip"
+                           " 'no executable' / 'distributor match only' entries)")
     p_ls.set_defaults(func=cmd_ls)
 
     p_info = sub.add_parser("info", help="show the executables registered for an app")
