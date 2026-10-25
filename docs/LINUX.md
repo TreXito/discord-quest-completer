@@ -94,9 +94,11 @@ pnpm tauri dev               # or: pnpm build:linux for a release bundle
 `resources/src-linux` to `data/src-linux` next to the executable, which is where
 `create_fake_game` looks for the runner template.
 
-The app keeps its fake games in `games/` **next to the executable** (same as
-Windows). Extract the AppImage or the tarball somewhere you can write to; a
-read-only location such as `/usr/bin` will fail to create dummy files.
+Fake games are written to `${XDG_DATA_HOME:-~/.local/share}/discord-quest-completer/`
+on Linux, **not** next to the executable like on Windows: an AppImage is a
+read-only squashfs mount and `/usr/bin` is not writable, so "next to the binary"
+cannot work there. The CLI uses the same directory, so `dqc status` lists fake
+games the GUI started and vice versa.
 
 ### Runner
 

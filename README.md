@@ -22,13 +22,44 @@ https://github.com/user-attachments/assets/de904123-07df-41a9-8db1-ff05cc7ccc9b
 
 ---
 
+> [!NOTE]
+> This repository is a fork of [markterence/discord-quest-completer](https://github.com/markterence/discord-quest-completer) (MIT) with a Linux port: the desktop app builds and runs on Linux, and a headless CLI is included. See [docs/LINUX.md](docs/LINUX.md) for how Discord's Linux detection actually works.
+
+## ⚡ Quick start
+
+**Linux, headless (nothing to compile, needs only `python3`):**
+
+```bash
+git clone https://github.com/TreXito/discord-quest-completer
+cd discord-quest-completer
+./cli/dqc update
+./cli/dqc play "elden ring" --for 15m
+./cli/dqc status
+```
+
+**Linux, GUI (compiles the Tauri app, ~3 minutes):**
+
+```bash
+sudo dnf install webkit2gtk4.1-devel gtk3-devel libappindicator-gtk3-devel \
+                 librsvg2-devel patchelf libsoup3-devel javascriptcoregtk4.1-devel \
+                 gcc gcc-c++ make pkgconf-pkg-config
+corepack enable                     # provides pnpm, or: npm i -g pnpm
+pnpm install
+pnpm build:linux                    # runner + frontend + tauri release bundle
+./src-tauri/target/release/discord-quest-completer
+```
+
+Full instructions, per-distro package names and troubleshooting: [Build from source](#-build-from-source).
+
+---
+
 ## 📥 Installation
 
 ### Windows
 
 You can download manually pre-built release binaries on the [Releases](https://github.com/markterence/discord-activity/releases) page.
 
-Alternatively, you can follow the [development setup instructions](#-development-setup) to build the app from source.
+Alternatively, you can follow the [build from source instructions](#-build-from-source) to build the app from source.
 
 > [!IMPORTANT]
 > Make sure you place or extract in a location where you have write or execute permissions.
@@ -40,6 +71,39 @@ Alternatively, you can follow the [development setup instructions](#-development
 > [!NOTE]
 > Webview2 is required to run the app. WebView2 comes preinstalled on Windows 11. On versions older than Windows 11 you may need to install it manually.
 > If you don't have it installed, you can download it from [here](https://developer.microsoft.com/en-us/microsoft-edge/webview2).
+
+### 🐧 Linux
+
+There are three ways in, pick one:
+
+1. **CLI, no build at all.** `cli/dqc` is a single dependency-free Python file.
+   It needs no WebKit, no Tauri, no Rust toolchain. This is the shortest path and
+   it supports exactly the same applications as the GUI.
+
+   ```bash
+   ./cli/dqc update                  # download Discord's detection list
+   ./cli/dqc ls                      # browse applications
+   ./cli/dqc play "elden ring"       # start faking
+   ./cli/dqc play overwatch --for 15m
+   ./cli/dqc stop --all
+   ```
+
+2. **Pre-built release files.** The `publish` workflow builds a Linux tarball
+   (`discord-quest-completer-linux-x86_64-<date>.tar.gz`) next to the Windows
+   zip on the [Releases](../../releases) page. Extract it and run the binary - it
+   expects the `data/` folder next to it, which the tarball already contains.
+
+3. **Build it yourself** - see [Build from source](#-build-from-source).
+
+On Linux the app writes its fake games to
+`${XDG_DATA_HOME:-~/.local/share}/discord-quest-completer/games/`, not next to
+the binary, so it also works from an AppImage, a `.deb` install or `/usr/bin`.
+The CLI uses the same directory, so `dqc status` sees what the GUI started.
+
+> [!IMPORTANT]
+> Discord detects a game by the **file name** of a running process, so any of
+> Discord's ~24,883 detectable applications works, not just the handful that
+> publish a native Linux executable name. No Proton, no Wine, no game files.
 
 
 ## Uninstall
@@ -55,6 +119,24 @@ discord-quest-completer/
 │   ├── src-win.exe (runner dummy template)
 ├── games/
 │    ├── <game-id>/
+```
+
+On Linux the fake games live outside the app folder instead, so deleting the app
+leaves them behind:
+
+```text
+~/.local/share/discord-quest-completer/
+├── games/
+│    ├── <app-id>/
+│        ├── .dqc.json      (manifest: app name, executable, arguments)
+│        ├── .dqc.pid       (pid while it runs)
+│        └── overwatch.exe  (the dummy executable)
+├── games-v1.json           (detection list snapshot, CLI only)
+└── runner/src-linux        (runner copy, CLI only)
+```
+
+```bash
+./cli/dqc stop --all && ./cli/dqc clean   # or simply: rm -rf ~/.local/share/discord-quest-completer
 ```
 
 <!-- COMMENT:
@@ -184,48 +266,123 @@ apps, Discord's executable blocklist, quest types) live in
 - 🌐 Vue.js
 - 🧰 Tauri
 
-## 🧑‍💻 Development Setup
-
-### 🖥️ Recommended IDE Setup
-
-- [VS Code](https://code.visualstudio.com/) + [Volar](https://marketplace.visualstudio.com/items?itemName=Vue.volar) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+## 🔨 Build from source
 
 ### 📋 Requirements
 
-- Tauri - make sure the [pre-requisites](https://tauri.app/start/prerequisites/) are installed such as Rust.
-- NodeJS - use any that is latest or node 20+
-- pnpm - project uses pnpm as package manager for the frontend.
+| Thing | Why |
+| --- | --- |
+| Rust (stable, 1.77+) | Tauri backend. `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
+| Node 20+ and pnpm | Vue frontend. `corepack enable` (ships with Node) or `npm i -g pnpm` |
+| WebKitGTK 4.1 + GTK3 + libsoup3 | the window on Linux (Tauri 2, **not** the old 4.0) |
+| gcc + make | builds the runner; the runner is plain C |
 
-### 🛠️ Development
+You do **not** need the WebKit stack if you only want the CLI: `./cli/dqc` is one
+Python file with no dependencies.
 
-Install dependencies for the Vue.js frontend using pnpm
+### 🐧 Linux packages
+
+**Nobara / Fedora:**
 
 ```bash
+sudo dnf install webkit2gtk4.1-devel gtk3-devel libappindicator-gtk3-devel \
+                 librsvg2-devel patchelf libsoup3-devel javascriptcoregtk4.1-devel \
+                 openssl-devel gcc gcc-c++ make pkgconf-pkg-config
+```
+
+**Debian / Ubuntu / Mint:**
+
+```bash
+sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+                 librsvg2-dev patchelf libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
+                 build-essential curl file
+```
+
+**Arch:**
+
+```bash
+sudo pacman -S webkit2gtk-4.1 gtk3 libappindicator-gtk3 librsvg patchelf libsoup3 base-devel
+```
+
+### 🛠️ Build
+
+```bash
+git clone https://github.com/TreXito/discord-quest-completer
+cd discord-quest-completer
 pnpm install
+pnpm build:linux
 ```
 
-Make sure to build and copy the dummy game binary for your platform into the tauri application's "resources" folder.
+`pnpm build:linux` is three steps, run them separately if something breaks:
 
 ```bash
-# Windows
-pnpm build:runner:win && pnpm copy:runner:win
-# Linux (cargo, or gcc as a fallback)
+pnpm build:runner:linux   # 1. compile src-linux (cargo, or gcc as a fallback)
+pnpm copy:runner:linux    # 2. copy it to src-tauri/resources/src-linux
+pnpm tauri build          # 3. frontend + Rust + bundling
+```
+
+The runner alone, without touching the app:
+
+```bash
+cd src-linux && ./build.sh            # cargo build --release, or cc if cargo is unusable
+FORCE_CC=1 ./build.sh                 # force gcc/clang, ~30ms
+./build.sh --copy                     # also install it into src-tauri/resources/
+```
+
+Output:
+
+```text
+src-tauri/target/release/discord-quest-completer        the app (needs data/src-linux next to it)
+src-tauri/target/release/data/src-linux                 the runner template
+src-tauri/target/release/bundle/deb/*.deb
+src-tauri/target/release/bundle/appimage/*.AppImage
+```
+
+Run it straight from the build tree:
+
+```bash
+./src-tauri/target/release/discord-quest-completer
+```
+
+Live development (hot reload for the Vue side):
+
+```bash
 pnpm build:runner:linux && pnpm copy:runner:linux
-```
-
-Then run the Tauri dev command to start the development server.
-
-```bash
 pnpm tauri dev
 ```
 
-- The app fetches the good list on its own at runtime, in this order:
-  `https://cdn.discordapp.com/detectables/games-v1.json` (what the Discord client
-  itself uses), the GitHub mirror, then `GET /api/applications/detectable`.
-  `src/assets/gamelist.json` is only a bundled fallback snapshot.
+### 🪟 Windows / 🍎 macOS
 
+Same three steps, with the platform specific runner:
 
----
+```bash
+pnpm build:runner:win   && pnpm copy:runner:win     # Windows
+pnpm build:runner:darwin && pnpm copy:runner:darwin # macOS
+pnpm tauri dev          # or: pnpm tauri build
+```
+
+### 🧯 Troubleshooting
+
+| Symptom | Cause / fix |
+| --- | --- |
+| `Failed to resolve runner template` | you skipped the runner: `pnpm build:runner:linux && pnpm copy:runner:linux` |
+| `webkit2gtk-4.1` not found, or `Package webkit2gtk-4.0 was not found` | wrong package generation; Tauri 2 wants **4.1** |
+| Blank white window on NVIDIA / Wayland | `WEBKIT_DISABLE_DMABUF_RENDERER=1 ./src-tauri/target/release/discord-quest-completer` |
+| AppImage will not start (`libfuse.so.2`) | `sudo dnf install fuse-libs`, or run it with `--appimage-extract-and-run` |
+| Game never shows up in Discord | Discord needs its detection list (~1 min after login). Check with `./cli/dqc doctor`; some names are blocklisted by Discord and the tool warns about those |
+| `dqc: no Linux runner found` | build the runner once: `cd src-linux && ./build.sh --copy`, or let it auto-pick `src-tauri/resources/src-linux` |
+
+### 🗂️ Where the game list comes from
+
+The app fetches it at runtime, best source first:
+
+1. `https://cdn.discordapp.com/detectables/games-v1.json` - the file the Discord
+   client itself uses (24,883 applications, every platform's executables).
+2. the project's GitHub mirror,
+3. `GET /api/v10/applications/detectable` - a smaller, older public mirror.
+
+`src/assets/gamelist.json` is only a bundled fallback snapshot. `./cli/dqc update`
+refreshes the CLI's own copy into `~/.local/share/discord-quest-completer/`.
 
 ## Other Thoughts
 

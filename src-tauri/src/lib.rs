@@ -49,7 +49,39 @@ fn game_folder_path(exe_dir: &Path, path: &str, app_id: i64) -> PathBuf {
         .join(normalized_path)
 }
 
-/// Directory holding one fake game, always `<exe dir>/games/<app id>`.
+/// Where fake games are written.
+///
+/// Windows keeps them next to the executable (that is how the original app
+/// works, and it keeps everything in one portable folder). Linux moves them to
+/// the XDG data dir instead: an AppImage is a read-only squashfs mount and
+/// `/usr/bin` is not writable either, so "next to the executable" simply fails
+/// there. The CLI (`cli/dqc`) uses exactly this path, so both front ends share
+/// the same fake games, pid files and manifests.
+fn fake_games_base_dir() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(xdg) = env::var("XDG_DATA_HOME") {
+            if !xdg.is_empty() {
+                return PathBuf::from(xdg).join("discord-quest-completer");
+            }
+        }
+        if let Some(home) = env::var_os("HOME") {
+            return PathBuf::from(home).join(".local/share/discord-quest-completer");
+        }
+        PathBuf::from("/tmp/discord-quest-completer")
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let exe_path = env::current_exe().unwrap_or_default();
+        exe_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf()
+    }
+}
+
+/// Directory holding one fake game, always `<base dir>/games/<app id>`.
 /// The pid file and the manifest live here, the executable may be nested.
 fn game_root_path(exe_dir: &Path, app_id: i64) -> PathBuf {
     exe_dir.join("games").join(app_id.to_string())
@@ -242,10 +274,7 @@ async fn create_fake_game(
     arguments: Option<String>,
 ) -> Result<String, String> {
     let _ = path_len;
-    // Must create in the same directory as the executable to avoid permission issues
-    // Get the executable directory to look for config file
-    let exe_path: std::path::PathBuf = env::current_exe().unwrap_or_default();
-    let exe_dir = exe_path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    let exe_dir = fake_games_base_dir();
 
     validate_executable_name(executable_name)?;
     let game_folder_path = game_folder_path(&exe_dir, path, app_id);
@@ -352,8 +381,7 @@ async fn run_background_process(
     let _ = path_len;
     validate_executable_name(executable_name)?;
 
-    let exe_path = env::current_exe().unwrap_or_default();
-    let exe_dir = exe_path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    let exe_dir = fake_games_base_dir();
 
     let game_folder_path = game_folder_path(&exe_dir, path, app_id);
 
@@ -482,8 +510,7 @@ async fn stop_process(
     #[cfg(target_os = "linux")]
     {
         let _ = process_name;
-        let exe_path = env::current_exe().unwrap_or_default();
-        let exe_dir = exe_path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        let exe_dir = fake_games_base_dir();
         let mut pids: Vec<i32> = Vec::new();
 
         let root = app_id.map(|id| game_root_path(&exe_dir, id)).or_else(|| {
@@ -533,8 +560,7 @@ async fn stop_process(
 /// after a restart instead of claiming nothing is installed.
 #[tauri::command(rename_all = "snake_case")]
 async fn list_fake_games() -> Vec<serde_json::Value> {
-    let exe_path = env::current_exe().unwrap_or_default();
-    let exe_dir = exe_path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    let exe_dir = fake_games_base_dir();
     let games_dir = exe_dir.join("games");
     let mut out = Vec::new();
 
