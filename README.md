@@ -89,6 +89,7 @@ EBWebView
 - Simulate playing verified Discord games without intalling a full game!
 - Complete Discord Quests requiring 15-minute gameplay (not yet tested for Stream the game Quests)
 - Only Discord Verified games are supported. The application fetches a list of games that Discord can automatically detect.
+- Windows, Linux (GUI + CLI) and macOS. On Linux any of Discord's ~24,883 detectable applications can be faked, because the detection there is name based.
 
 ## ⚙️ How It Works
 
@@ -137,19 +138,43 @@ The dummy game executale files used by this program are placed in a folder calle
 ## 🖥️ Supported Platforms
 
 - Windows 11 (not tested on Windows 10 but it should work)
+- **Linux** (x86_64, GUI and headless CLI) - see [docs/LINUX.md](docs/LINUX.md)
+- macOS (experimental, needs a visible window)
 
-### 🐧 Linux and 🍎 MacOS Support?
+### 🐧 Linux
 
-_TL;DR: Linux and macOS are not supported._
+Linux works differently, and it works for **every** application Discord knows about
+(~24,883), not just the few that ship a native Linux executable name.
 
-Currently, only Windows is supported. I will try to add Linux support if I can. I don't have a macOS machine to test on, so macOS support is not going to happen.
+Discord on Linux downloads `cdn.discordapp.com/detectables/games-v1.json`, hands
+every executable name in it to `discord_utils.node`, and the Linux process
+observer then walks `/proc/<pid>/exe` and matches the file name. There is no
+platform filter, so a process named `overwatch.exe` is Overwatch. No window, no
+Proton, no Wine.
 
-The reason for not having Linux and macOS support right now is that I want to make sure the dummy game runner has a minimal size — around 100KB or less for each platform.  
-For Windows, for example, I used Rust and the `windows` crate to access the Win32 API and create a dummy window. This compiles to a small 136KB executable.  
-I also tried a C# .NET app, which is fantastically small — only 7KB — but it may require the end-user to install the .NET 4.7 Runtime.
+Because of that the Linux runner (`src-linux/`) is ~15 KB of C that links only
+libc: it is copied to `<app id>/<executable name>` and simply stays running.
 
-For Linux, I don’t know where to start yet. I will try to explore more options to keep the runner binary small. It’s also a pain (Wine, Proton, etc. How does Discord detection even work on Linux? LMAO — same for macOS).  
-Additionally, if you are trying to run the windows build trough Wine in Linux, some of the dependencies such as Microsoft WebView2 somewhat problematic to install and get running.
+```bash
+pnpm install
+pnpm build:runner:linux && pnpm copy:runner:linux   # or: cd src-linux && ./build.sh --copy
+pnpm tauri dev                                      # GUI
+```
+
+Headless, no WebKit/Tauri needed at all:
+
+```bash
+./cli/dqc update                    # fetch Discord's detection list
+./cli/dqc ls elden                 # search applications
+./cli/dqc play "elden ring" --for 15m
+./cli/dqc status
+./cli/dqc stop --all
+./cli/dqc doctor                    # check what Discord can currently see
+```
+
+Full mechanism notes, the CLI reference and the known limits (fingerprint-verified
+apps, Discord's executable blocklist, quest types) live in
+[docs/LINUX.md](docs/LINUX.md).
 
 ---
 
@@ -179,10 +204,13 @@ Install dependencies for the Vue.js frontend using pnpm
 pnpm install
 ```
 
-Make sure to build and copy the dummy game binary from `src-win` and is add it on tauri application's "resources" folder.
+Make sure to build and copy the dummy game binary for your platform into the tauri application's "resources" folder.
 
 ```bash
+# Windows
 pnpm build:runner:win && pnpm copy:runner:win
+# Linux (cargo, or gcc as a fallback)
+pnpm build:runner:linux && pnpm copy:runner:linux
 ```
 
 Then run the Tauri dev command to start the development server.
@@ -191,7 +219,10 @@ Then run the Tauri dev command to start the development server.
 pnpm tauri dev
 ```
 
-- Also, get the list of detecatable games from the Discord API: `GET /api/applications/detectable` or `GET /api/:version/applications/detectable` and place the JSON file in `src/assets/gamelist.json`
+- The app fetches the good list on its own at runtime, in this order:
+  `https://cdn.discordapp.com/detectables/games-v1.json` (what the Discord client
+  itself uses), the GitHub mirror, then `GET /api/applications/detectable`.
+  `src/assets/gamelist.json` is only a bundled fallback snapshot.
 
 
 ---

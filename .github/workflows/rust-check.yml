@@ -6,6 +6,9 @@ on:
     paths:
       - '**/*.rs'
       - '**/Cargo.toml'
+      - 'src-linux/**'
+      - 'src/**'
+      - 'cli/**'
   schedule:
     - cron: "0 0 */2 * *"   # every 2 days at midnight
   workflow_dispatch:
@@ -122,6 +125,26 @@ jobs:
             src-tauri/target/debug/bundle/
             src-tauri/target/debug/data/
             src-tauri/target/debug/resources/
+
+  # The Linux runner is plain C with a thin cargo wrapper, so it is cheap to
+  # verify and worth verifying on every change: it is the only thing that makes
+  # Discord on Linux see a fake game.
+  build-runner-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with the C compiler only
+        run: |
+          chmod +x ./src-linux/build.sh
+          FORCE_CC=1 sh ./src-linux/build.sh
+          ./src-linux/src-linux-bin --help
+
+      - name: Build with cargo
+        run: |
+          sh ./src-linux/build.sh
+          ./src-linux/target/release/src-linux --help
+          ls -l ./src-linux/target/release/src-linux
 
   release-check:
     needs: build-tauri
