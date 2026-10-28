@@ -65,15 +65,13 @@ jobs:
         env:
           GAME_LIST_URL: ${{ secrets.GAME_LIST_URL }}
         run: |
-          curl -L -o src/assets/gamelist.json $GAME_LIST_URL
-          if [ ! -f src/assets/gamelist.json ]; then
-            echo "Failed to download game list"
-            exit 1
-          fi
-          if [ ! -s src/assets/gamelist.json ]; then
-            echo "Game list is empty"
-            exit 1
-          fi
+          # The upstream repo kept this URL in a secret; fall back to the file the
+          # Discord client itself uses when it is not configured here.
+          url="${GAME_LIST_URL:-https://cdn.discordapp.com/detectables/games-v1.json}"
+          curl -fsSL --retry 3 -o src/assets/gamelist.json "$url"
+          python3 -c "import json;json.load(open('src/assets/gamelist.json'))" \
+            || { echo "game list is not valid JSON"; exit 1; }
+          ls -l src/assets/gamelist.json
       
       # Build src-win
       - name: Build src-win project x86_64 binary
@@ -142,7 +140,9 @@ jobs:
 
       - name: Build with cargo
         run: |
-          sh ./src-linux/build.sh
+          # FORCE_CARGO=1 exercises the fallback used when no C compiler exists;
+          # the default (plain ./build.sh) builds the tiny cc runner instead.
+          FORCE_CARGO=1 sh ./src-linux/build.sh
           ./src-linux/target/release/src-linux --help
           ls -l ./src-linux/target/release/src-linux
 

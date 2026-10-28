@@ -66,20 +66,19 @@ jobs:
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-index-
 
-      - name: Get Game List from Discord API
+      - name: Get Game List
         shell: bash
+        env:
+          GAME_LIST_URL: ${{ secrets.GAME_LIST_URL }}
         run: |
-          # Téléchargement direct depuis l'API Discord
-          curl -L -o src/assets/gamelist.json "https://discord.com/api/v10/applications/detectable"
-          
-          if [ ! -f src/assets/gamelist.json ]; then
-            echo "Failed to download game list from Discord"
-            exit 1
-          fi
-          if [ ! -s src/assets/gamelist.json ]; then
-            echo "Game list is empty"
-            exit 1
-          fi
+          # Same source the Discord client uses (the old /api/v10/applications/
+          # detectable mirror is smaller and drifts); validated so a 404 body can
+          # never end up bundled as the fallback snapshot.
+          url="${GAME_LIST_URL:-https://cdn.discordapp.com/detectables/games-v1.json}"
+          curl -fsSL --retry 3 -o src/assets/gamelist.json "$url"
+          python3 -c "import json;json.load(open('src/assets/gamelist.json'))" \
+            || { echo "game list is not valid JSON"; exit 1; }
+          ls -l src/assets/gamelist.json
       
       # Build src-win
       - name: Build src-win project x86_64 binary
