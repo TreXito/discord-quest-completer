@@ -205,7 +205,7 @@ async function createDummyGame(game: Game | null, executable: GameExecutable) {
             path: executable.path,
             executable_name: executable.filename,
             path_len: executable.segments,
-            app_id: Number(gameToInstall.id),
+            app_id: String(gameToInstall.id),
             display_name: gameToInstall.name,
             // some detectable entries are only matched together with arguments
             arguments: executableItem.arguments ?? '',
@@ -252,7 +252,7 @@ async function playGame({game, executable}: {game: Game, executable: GameExecuta
                 path: executable.path,
                 executable_name: executable.filename,
                 path_len: executable.segments,
-                app_id: Number(gameToPlay.id),
+                app_id: String(gameToPlay.id),
                 exec_path: path.join(executable.path!, executable.filename!),
                 arguments: executableItem.arguments ?? '',
             } 
@@ -283,7 +283,7 @@ async function stopPlaying({game, executable}: {game: Game, executable: GameExec
         try {
             await invoke('stop_process', {
                 exec_name: executable.filename!,
-                app_id: Number(gameToPlay.id),
+                app_id: String(gameToPlay.id),
                 path: executable.path ?? '',
             })
             addLog('info', `Stopped game process: ${game.name}`);
