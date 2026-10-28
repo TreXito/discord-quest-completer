@@ -76,6 +76,10 @@ if [ "$MODE" = uninstall ]; then
         [ -e "$f" ] && rm -f "$f" && say "removed $f"
     done
     [ -d "$BIN_DIR/data" ] && rm -rf "$BIN_DIR/data" && say "removed $BIN_DIR/data"
+    if [ -d "$PREFIX/lib/Discord Quest Completer" ]; then
+        rm -rf "$PREFIX/lib/Discord Quest Completer"
+        say "removed $PREFIX/lib/Discord Quest Completer"
+    fi
     [ -d "$SHARE_DIR" ] && rm -rf "$SHARE_DIR" && say "removed $SHARE_DIR"
     if [ "$PURGE" = 1 ] && [ -d "$DATA_DIR" ]; then
         rm -rf "$DATA_DIR" && say "removed data $DATA_DIR (game list, fake games)"
@@ -177,13 +181,17 @@ say "installed runner     $DATA_DIR/runner/src-linux ($(wc -c <"$DATA_DIR/runner
 if [ "$WITH_GUI" = 1 ] && [ -n "$GUI_SRC" ]; then
     mkdir -p "$APPS_DIR" "$ICON_DIR"
     install -m 0755 "$GUI_SRC" "$BIN_DIR/discord-quest-completer"
-    # The GUI resolves its runner template as <resource_dir>/data/src-linux
-    # (src-tauri/src/lib.rs: runner_resource_name). For a portable binary the
-    # resource dir is the binary's own directory, so data/ has to sit next to it.
-    # Without this, "Play" fails in the GUI with "Failed to resolve runner
-    # template" even though the CLI works.
-    mkdir -p "$BIN_DIR/data"
-    install -m 0755 "$RUNNER_SRC" "$BIN_DIR/data/src-linux"
+    # Tauri resolves BaseDirectory::Resource on Linux to
+    #   <exe_dir>/../lib/<productName>   if that exists
+    #   $APPDIR/usr/lib/<productName>    inside an AppImage
+    #   /usr/lib/<productName>           otherwise (tauri-utils/platform.rs)
+    # and this app asks for data/src-linux, exactly like the .deb layout
+    # (usr/lib/Discord Quest Completer/data/src-linux). So a portable install
+    # needs that directory too, otherwise Play fails in the GUI while the CLI
+    # (which uses the XDG data dir) keeps working.
+    LIB_APP_DIR="$PREFIX/lib/Discord Quest Completer"
+    mkdir -p "$LIB_APP_DIR/data"
+    install -m 0755 "$RUNNER_SRC" "$LIB_APP_DIR/data/src-linux"
     [ -f "${ICON_SRC:-}" ] && install -m 0644 "$ICON_SRC" "$ICON_DIR/discord-quest-completer.png"
 
     cat > "$APPS_DIR/discord-quest-completer.desktop" <<EOF
@@ -200,7 +208,7 @@ EOF
     chmod 0644 "$APPS_DIR/discord-quest-completer.desktop"
     command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS_DIR" 2>/dev/null || true
     say "installed GUI        $BIN_DIR/discord-quest-completer"
-    say "installed runner tpl $BIN_DIR/data/src-linux"
+    say "installed runner tpl $LIB_APP_DIR/data/src-linux"
     say "installed menu entry $APPS_DIR/discord-quest-completer.desktop"
 fi
 
