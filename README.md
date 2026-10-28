@@ -398,6 +398,7 @@ pnpm tauri dev          # or: pnpm tauri build
 | Symptom | Cause / fix |
 | --- | --- |
 | `Failed to resolve runner template` | you skipped the runner: `pnpm build:runner:linux && pnpm copy:runner:linux` |
+| GUI Play fails, CLI works | the binary was copied somewhere without its `data/` folder. The GUI resolves `<exe dir>/data/src-linux` (`src-tauri/src/lib.rs`). `install.sh --with-gui` now installs that too; for a manual copy, put `data/src-linux` next to the binary. |
 | `webkit2gtk-4.1` not found, or `Package webkit2gtk-4.0 was not found` | wrong package generation; Tauri 2 wants **4.1** |
 | Blank white window on NVIDIA / Wayland | `WEBKIT_DISABLE_DMABUF_RENDERER=1 ./src-tauri/target/release/discord-quest-completer` |
 | AppImage will not start (`libfuse.so.2`) | `sudo dnf install fuse-libs`, or run it with `--appimage-extract-and-run` |
