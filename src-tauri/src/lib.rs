@@ -40,6 +40,18 @@ fn bundle_binary_name(app_name: &str) -> String {
         .to_string()
 }
 
+/// Discord app ids are bigger than 2^53 (e.g. 363445589247131668 for ROBLOX),
+/// so they cannot survive a round trip through a JavaScript `Number`: the
+/// frontend used to send `Number(game.id)` and the GUI happily created
+/// `games/363445589247131650/` while the CLI and Discord's own list use
+/// `...668`. They therefore cross the IPC boundary as strings and are parsed
+/// here; the RPC path (`runner::ActivityParams`) has always done this.
+fn parse_app_id(raw: &str) -> Result<i64, String> {
+    raw.trim()
+        .parse::<i64>()
+        .map_err(|e| format!("invalid app id {raw:?}: {e}"))
+}
+
 fn game_folder_path(exe_dir: &Path, path: &str, app_id: i64) -> PathBuf {
     let normalized_path = Path::new(path).to_string_lossy().to_string();
 
@@ -269,11 +281,12 @@ async fn create_fake_game(
     path: &str,
     executable_name: &str,
     path_len: i64,
-    app_id: i64,
+    app_id: String,
     display_name: Option<String>,
     arguments: Option<String>,
 ) -> Result<String, String> {
     let _ = path_len;
+    let app_id = parse_app_id(&app_id)?;
     let exe_dir = fake_games_base_dir();
 
     validate_executable_name(executable_name)?;
@@ -330,7 +343,7 @@ async fn create_fake_game(
             // app agree on where a fake game is, even when the executable sits
             // in a nested folder ("bin/x64/game.exe").
             let manifest = serde_json::json!({
-                "app_id": app_id,
+                "app_id": app_id.to_string(),
                 "app_name": display_name.clone().unwrap_or_default(),
                 "executable": executable_name,
                 "arguments": arguments.clone().unwrap_or_default(),
@@ -375,10 +388,11 @@ async fn run_background_process(
     path: &str,
     executable_name: &str,
     path_len: i64,
-    app_id: i64,
+    app_id: String,
     arguments: Option<String>,
 ) -> Result<String, String> {
     let _ = path_len;
+    let app_id = parse_app_id(&app_id)?;
     validate_executable_name(executable_name)?;
 
     let exe_dir = fake_games_base_dir();
@@ -446,9 +460,13 @@ async fn run_background_process(
 #[tauri::command(rename_all = "snake_case")]
 async fn stop_process(
     exec_name: String,
-    app_id: Option<i64>,
+    app_id: Option<String>,
     path: Option<String>,
 ) -> Result<(), String> {
+    let app_id = match app_id {
+        Some(raw) => Some(parse_app_id(&raw)?),
+        None => None,
+    };
     let process_name = stop_process_name(&exec_name);
 
     #[cfg(target_os = "windows")]
@@ -598,7 +616,7 @@ async fn list_fake_games() -> Vec<serde_json::Value> {
         let pids: Vec<i32> = Vec::new();
 
         if let Some(object) = manifest.as_object_mut() {
-            object.insert("app_id".into(), serde_json::json!(app_id));
+            object.insert("app_id".into(), serde_json::json!(app_id.to_string()));
             object.insert("running".into(), serde_json::json!(!pids.is_empty()));
             object.insert("pids".into(), serde_json::json!(pids));
         }
